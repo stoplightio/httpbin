@@ -11,6 +11,7 @@ import base64
 import json
 import os
 import random
+import re
 import time
 import uuid
 import argparse
@@ -27,11 +28,10 @@ from flask import (
     abort,
 )
 from six.moves import range as xrange
-from werkzeug.datastructures import WWWAuthenticate, MultiDict
+from werkzeug.datastructures import WWWAuthenticate, MultiDict, Authorization
 from werkzeug.http import http_date
 from werkzeug.wrappers import Response
-from werkzeug.http import parse_authorization_header
-from flasgger import Swagger, NO_SANITIZER
+from flasgger import Swagger
 
 from . import filters
 from .helpers import (
@@ -83,7 +83,7 @@ Response.autocorrect_location_header = False
 tmpl_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates")
 
 app = Flask(__name__, template_folder=tmpl_dir)
-app.debug = bool(os.environ.get("DEBUG"))
+app.debug = os.environ.get("DEBUG", "").lower() in ("true", "1")
 app.config["JSONIFY_PRETTYPRINT_REGULAR"] = True
 
 app.add_template_global("HTTPBIN_TRACKING" in os.environ, name="tracking_enabled")
@@ -158,7 +158,7 @@ swagger_config = {
     "specs_route": "/",
 }
 
-swagger = Swagger(app, sanitizer=NO_SANITIZER, template=template, config=swagger_config)
+swagger = Swagger(app, template=template, config=swagger_config)
 
 # Set up Bugsnag exception tracking, if desired. To use Bugsnag, install the
 # Bugsnag Python client with the command "pip install bugsnag", and set the
@@ -178,7 +178,7 @@ if os.environ.get("BUGSNAG_API_KEY") is not None:
             ignore_classes=["werkzeug.exceptions.NotFound"],
         )
         bugsnag.flask.handle_exceptions(app)
-    except:
+    except Exception:
         app.logger.warning("Unable to initialize Bugsnag exception handling.")
 
 # -----------
@@ -210,13 +210,23 @@ def before_request():
             else:
                 request.environ["wsgi.input_terminated"] = 1
         else:
-            abort(501, "Chunked requests are not supported for server %s" % server)
+            abort(501, "Chunked requests are not supported by this server")
 
 
 @app.after_request
 def set_cors_headers(response):
-    response.headers["Access-Control-Allow-Origin"] = request.headers.get("Origin", "*")
-    response.headers["Access-Control-Allow-Credentials"] = "true"
+    # Use a configurable allowed origins list via ALLOWED_ORIGINS env var
+    # (comma-separated). If not set, default to wildcard '*' without credentials.
+    allowed_origins = os.environ.get("ALLOWED_ORIGINS", "").split(",")
+    allowed_origins = [o.strip() for o in allowed_origins if o.strip()]
+    request_origin = request.headers.get("Origin", "")
+
+    if allowed_origins and request_origin in allowed_origins:
+        response.headers["Access-Control-Allow-Origin"] = request_origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+    else:
+        # Wildcard '*' is safe — browsers will NOT send credentials with '*'
+        response.headers["Access-Control-Allow-Origin"] = "*"
 
     if request.method == "OPTIONS":
         # Both of these headers are only used for the "preflight request"
@@ -226,9 +236,20 @@ def set_cors_headers(response):
         ] = "GET, POST, PUT, DELETE, PATCH, OPTIONS"
         response.headers["Access-Control-Max-Age"] = "3600"  # 1 hour cache
         if request.headers.get("Access-Control-Request-Headers") is not None:
-            response.headers["Access-Control-Allow-Headers"] = request.headers[
-                "Access-Control-Request-Headers"
-            ]
+            # Sanitize: only allow alphanumeric header names, hyphens, and commas
+            raw = request.headers["Access-Control-Request-Headers"]
+            safe_headers = ", ".join(
+                h.strip() for h in raw.split(",")
+                if re.match(r'^[A-Za-z0-9\-]+$', h.strip())
+            )
+            if safe_headers:
+                response.headers["Access-Control-Allow-Headers"] = safe_headers
+
+    # Security headers
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Content-Security-Policy"] = "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; img-src 'self' data:"
+
     return response
 
 
@@ -379,10 +400,10 @@ def view_get():
     return jsonify(get_dict("url", "args", "headers", "origin"))
 
 
-@app.route("/anything", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "TRACE"])
+@app.route("/anything", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
 @app.route(
     "/anything/<path:anything>",
-    methods=["GET", "POST", "PUT", "DELETE", "PATCH", "TRACE"],
+    methods=["GET", "POST", "PUT", "DELETE", "PATCH"],
 )
 def view_anything(anything=None):
     """Returns anything passed in request data.
@@ -550,7 +571,8 @@ def redirect_n_times(n):
       302:
         description: A redirection.
     """
-    assert n > 0
+    if n <= 0:
+        abort(400, "Number of redirects must be positive")
 
     absolute = request.args.get("absolute", "false").lower() == "true"
 
@@ -569,7 +591,7 @@ def _redirect(kind, n, external):
     )
 
 
-@app.route("/redirect-to", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "TRACE"])
+@app.route("/redirect-to", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
 def redirect_to():
     """302/3XX Redirects to the given URL.
     ---
@@ -630,16 +652,30 @@ def redirect_to():
     args_dict = request.args.items()
     args = CaseInsensitiveDict(args_dict)
 
+    redirect_url = args.get("url", "")
+
+    # Validate redirect URL to prevent open redirect attacks.
+    # Block URLs with schemes other than http/https, and reject protocol-relative URLs.
+    from six.moves.urllib.parse import urlparse as _urlparse
+    parsed = _urlparse(redirect_url)
+    if parsed.scheme and parsed.scheme.lower() not in ("http", "https"):
+        return Response("Invalid redirect URL: unsafe scheme", status=400)
+    if redirect_url.startswith("//"):
+        return Response("Invalid redirect URL: protocol-relative URLs are not allowed", status=400)
+
     # We need to build the response manually and convert to UTF-8 to prevent
     # werkzeug from "fixing" the URL. This endpoint should set the Location
     # header to the exact string supplied.
     response = app.make_response("")
     response.status_code = 302
     if "status_code" in args:
-        status_code = int(args["status_code"])
+        try:
+            status_code = int(args["status_code"])
+        except (ValueError, TypeError):
+            return Response("Invalid status_code parameter", status=400)
         if status_code >= 300 and status_code < 400:
             response.status_code = status_code
-    response.headers["Location"] = args["url"].encode("utf-8")
+    response.headers["Location"] = redirect_url.encode("utf-8")
 
     return response
 
@@ -661,7 +697,8 @@ def relative_redirect_n_times(n):
         description: A redirection.
     """
 
-    assert n > 0
+    if n <= 0:
+        abort(400, "Number of redirects must be positive")
 
     response = app.make_response("")
     response.status_code = 302
@@ -691,7 +728,8 @@ def absolute_redirect_n_times(n):
         description: A redirection.
     """
 
-    assert n > 0
+    if n <= 0:
+        abort(400, "Number of redirects must be positive")
 
     if n == 1:
         return redirect(url_for("view_get", _external=True))
@@ -727,7 +765,7 @@ def stream_n_messages(n):
 
 
 @app.route(
-    "/status/<codes>", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "TRACE"]
+    "/status/<codes>", methods=["GET", "POST", "PUT", "DELETE", "PATCH"]
 )
 def view_status_code(codes):
     """Return status code or random status code if more than one are given
@@ -801,8 +839,19 @@ def response_headers():
     """
     # Pending swaggerUI update
     # https://github.com/swagger-api/swagger-ui/issues/3850
+    # Block security-sensitive headers from being overridden by user input
+    BLOCKED_HEADERS = {
+        "content-security-policy", "x-frame-options", "x-content-type-options",
+        "strict-transport-security", "set-cookie", "access-control-allow-origin",
+        "access-control-allow-credentials", "transfer-encoding", "host",
+        "connection", "www-authenticate", "proxy-authenticate",
+    }
     headers = MultiDict(request.args.items(multi=True))
-    response = jsonify(list(headers.lists()))
+    # Filter out blocked header names
+    safe_headers = MultiDict(
+        [(k, v) for k, v in headers.items(multi=True) if k.lower() not in BLOCKED_HEADERS]
+    )
+    response = jsonify(list(safe_headers.lists()))
 
     while True:
         original_data = response.data
@@ -813,7 +862,7 @@ def response_headers():
                 value = value[0]
             d[key] = value
         response = jsonify(d)
-        for key, value in headers.items(multi=True):
+        for key, value in safe_headers.items(multi=True):
             response.headers.add(key, value)
         response_has_changed = response.data != original_data
         if not response_has_changed:
@@ -874,7 +923,7 @@ def set_cookie(name, value):
     """
 
     r = app.make_response(redirect(url_for("view_cookies")))
-    r.set_cookie(key=name, value=value, secure=secure_cookie())
+    r.set_cookie(key=name, value=value, secure=secure_cookie(), httponly=True)
 
     return r
 
@@ -905,7 +954,7 @@ def set_cookies():
     cookies = dict(request.args.items())
     r = app.make_response(redirect(url_for("view_cookies")))
     for key, value in cookies.items():
-        r.set_cookie(key=key, value=value, secure=secure_cookie())
+        r.set_cookie(key=key, value=value, secure=secure_cookie(), httponly=True)
 
     return r
 
@@ -1139,7 +1188,7 @@ def digest_auth(
     authorization = request.headers.get("Authorization")
     credentials = None
     if authorization:
-        credentials = parse_authorization_header(authorization)
+        credentials = Authorization.from_header(authorization)
 
     if (
         not authorization
@@ -1148,13 +1197,13 @@ def digest_auth(
         or (require_cookie_handling and "Cookie" not in request.headers)
     ):
         response = digest_challenge_response(app, qop, algorithm)
-        response.set_cookie("stale_after", value=stale_after)
-        response.set_cookie("fake", value="fake_value")
+        response.set_cookie("stale_after", value=stale_after, secure=secure_cookie(), httponly=True)
+        response.set_cookie("fake", value="fake_value", secure=secure_cookie(), httponly=True)
         return response
 
     if require_cookie_handling and request.cookies.get("fake") != "fake_value":
         response = jsonify({"errors": ["missing cookie set on challenge"]})
-        response.set_cookie("fake", value="fake_value")
+        response.set_cookie("fake", value="fake_value", secure=secure_cookie(), httponly=True)
         response.status_code = 403
         return response
 
@@ -1170,29 +1219,29 @@ def digest_auth(
         or stale_after_value == "0"
     ):
         response = digest_challenge_response(app, qop, algorithm, True)
-        response.set_cookie("stale_after", value=stale_after)
-        response.set_cookie("last_nonce", value=current_nonce)
-        response.set_cookie("fake", value="fake_value")
+        response.set_cookie("stale_after", value=stale_after, secure=secure_cookie(), httponly=True)
+        response.set_cookie("last_nonce", value=current_nonce, secure=secure_cookie(), httponly=True)
+        response.set_cookie("fake", value="fake_value", secure=secure_cookie(), httponly=True)
         return response
 
     if not check_digest_auth(user, passwd):
         response = digest_challenge_response(app, qop, algorithm, False)
-        response.set_cookie("stale_after", value=stale_after)
-        response.set_cookie("last_nonce", value=current_nonce)
-        response.set_cookie("fake", value="fake_value")
+        response.set_cookie("stale_after", value=stale_after, secure=secure_cookie(), httponly=True)
+        response.set_cookie("last_nonce", value=current_nonce, secure=secure_cookie(), httponly=True)
+        response.set_cookie("fake", value="fake_value", secure=secure_cookie(), httponly=True)
         return response
 
     response = jsonify(authenticated=True, user=user)
-    response.set_cookie("fake", value="fake_value")
+    response.set_cookie("fake", value="fake_value", secure=secure_cookie(), httponly=True)
     if stale_after_value:
         response.set_cookie(
-            "stale_after", value=next_stale_after_value(stale_after_value)
+            "stale_after", value=next_stale_after_value(stale_after_value), secure=secure_cookie(), httponly=True
         )
 
     return response
 
 
-@app.route("/delay/<delay>", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "TRACE"])
+@app.route("/delay/<delay>", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
 def delay_response(delay):
     """Returns a delayed response (max of 10 seconds).
     ---
@@ -1208,7 +1257,13 @@ def delay_response(delay):
       200:
         description: A delayed response.
     """
-    delay = min(float(delay), 10)
+    try:
+        delay = min(float(delay), 10)
+    except (ValueError, TypeError):
+        return Response("Invalid delay value", status=400)
+
+    if delay < 0:
+        delay = 0
 
     time.sleep(delay)
 
@@ -1255,15 +1310,23 @@ def drip():
         description: A dripped response.
     """
     args = CaseInsensitiveDict(request.args.items())
-    duration = float(args.get("duration", 2))
-    numbytes = min(int(args.get("numbytes", 10)), (10 * 1024 * 1024))  # set 10MB limit
-    code = int(args.get("code", 200))
+    try:
+        duration = float(args.get("duration", 2))
+        numbytes = int(args.get("numbytes", 10))
+        code = int(args.get("code", 200))
+        delay = float(args.get("delay", 0))
+    except (ValueError, TypeError):
+        return Response("Invalid parameter value", status=400)
+
+    # Cap duration and delay to prevent server thread exhaustion (DoS)
+    duration = min(max(0, duration), 10)
+    numbytes = min(numbytes, (10 * 1024 * 1024))  # set 10MB limit
+    delay = min(max(0, delay), 10)
 
     if numbytes <= 0:
         response = Response("number of bytes must be positive", status=400)
         return response
 
-    delay = float(args.get("delay", 0))
     if delay > 0:
         time.sleep(delay)
 
@@ -1306,9 +1369,12 @@ def decode_base64(value):
     """
     encoded = value.encode("utf-8")  # base64 expects binary string as input
     try:
-        return base64.urlsafe_b64decode(encoded).decode("utf-8")
-    except:
-        return "Incorrect Base64 data try: SFRUUEJJTiBpcyBhd2Vzb21l"
+        decoded = base64.urlsafe_b64decode(encoded).decode("utf-8")
+    except (ValueError, UnicodeDecodeError, Exception):
+        decoded = "Incorrect Base64 data try: SFRUUEJJTiBpcyBhd2Vzb21l"
+    # Return as text/plain to prevent XSS via decoded HTML/JS content
+    response = Response(decoded, headers={"Content-Type": "text/plain"})
+    return response
 
 
 @app.route("/cache", methods=("GET",))
@@ -1440,7 +1506,10 @@ def random_bytes(n):
 
     params = CaseInsensitiveDict(request.args.items())
     if "seed" in params:
-        random.seed(int(params["seed"]))
+        try:
+            random.seed(int(params["seed"]))
+        except (ValueError, TypeError):
+            return Response("Invalid seed parameter", status=400)
 
     response = make_response()
 
@@ -1470,12 +1539,18 @@ def stream_random_bytes(n):
 
     params = CaseInsensitiveDict(request.args.items())
     if "seed" in params:
-        random.seed(int(params["seed"]))
+        try:
+            random.seed(int(params["seed"]))
+        except (ValueError, TypeError):
+            return Response("Invalid seed parameter", status=400)
 
-    if "chunk_size" in params:
-        chunk_size = max(1, int(params["chunk_size"]))
-    else:
-        chunk_size = 10 * 1024
+    try:
+        if "chunk_size" in params:
+            chunk_size = max(1, int(params["chunk_size"]))
+        else:
+            chunk_size = 10 * 1024
+    except (ValueError, TypeError):
+        return Response("Invalid chunk_size parameter", status=400)
 
     def generate_bytes():
         chunks = bytearray()
@@ -1520,12 +1595,18 @@ def range_request(numbytes):
         return response
 
     params = CaseInsensitiveDict(request.args.items())
-    if "chunk_size" in params:
-        chunk_size = max(1, int(params["chunk_size"]))
-    else:
-        chunk_size = 10 * 1024
+    try:
+        if "chunk_size" in params:
+            chunk_size = max(1, int(params["chunk_size"]))
+        else:
+            chunk_size = 10 * 1024
+    except (ValueError, TypeError):
+        return Response("Invalid chunk_size parameter", status=400)
 
-    duration = float(params.get("duration", 0))
+    try:
+        duration = min(max(0, float(params.get("duration", 0))), 10)  # Cap at 10s to prevent DoS
+    except (ValueError, TypeError):
+        return Response("Invalid duration parameter", status=400)
     pause_per_byte = duration / numbytes
 
     request_headers = get_headers()
@@ -1724,7 +1805,10 @@ def image_svg():
 
 
 def resource(filename):
-    path = os.path.join(tmpl_dir, filename)
+    path = os.path.realpath(os.path.join(tmpl_dir, filename))
+    # Prevent path traversal — ensure resolved path stays within tmpl_dir
+    if not path.startswith(os.path.realpath(tmpl_dir) + os.sep):
+        abort(403, "Access denied")
     with open(path, "rb") as f:
       return f.read()
 

@@ -1,4 +1,4 @@
-FROM ubuntu:18.04
+FROM ubuntu:22.04
 
 LABEL name="httpbin"
 LABEL version="0.9.2"
@@ -8,14 +8,21 @@ LABEL org.kennethreitz.vendor="Kenneth Reitz"
 ENV LC_ALL=C.UTF-8
 ENV LANG=C.UTF-8
 
-RUN apt update -y && apt install python3-pip git -y && pip3 install --no-cache-dir pipenv
+RUN apt-get update -y && apt-get install --no-install-recommends python3-pip git -y \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip3 install --no-cache-dir pipenv
 
-ADD Pipfile Pipfile.lock /httpbin/
+COPY Pipfile Pipfile.lock /httpbin/
 WORKDIR /httpbin
 RUN /bin/bash -c "pip3 install --no-cache-dir -r <(pipenv lock -r)"
 
-ADD . /httpbin
+COPY . /httpbin
 RUN pip3 install --no-cache-dir /httpbin
+
+# Run as non-root user to limit impact of container compromise
+RUN groupadd -r httpbin && useradd -r -g httpbin -d /httpbin -s /sbin/nologin httpbin \
+    && chown -R httpbin:httpbin /httpbin
+USER httpbin
 
 EXPOSE 80
 

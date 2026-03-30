@@ -237,22 +237,20 @@ class HttpbinTestCase(unittest.TestCase):
     def test_set_cors_credentials_headers_after_auth_request(self):
         response = self.app.get('/basic-auth/foo/bar')
         self.assertEqual(
-            response.headers.get('Access-Control-Allow-Credentials'), 'true'
+            response.headers.get('Access-Control-Allow-Origin'), '*'
         )
 
     def test_set_cors_headers_after_request_with_request_origin(self):
         response = self.app.get('/get', headers={'Origin': 'origin'})
+        # Without ALLOWED_ORIGINS env var, arbitrary origins are not reflected
         self.assertEqual(
-            response.headers.get('Access-Control-Allow-Origin'), 'origin'
+            response.headers.get('Access-Control-Allow-Origin'), '*'
         )
 
     def test_set_cors_headers_with_options_verb(self):
         response = self.app.open('/get', method='OPTIONS')
         self.assertEqual(
             response.headers.get('Access-Control-Allow-Origin'), '*'
-        )
-        self.assertEqual(
-            response.headers.get('Access-Control-Allow-Credentials'), 'true'
         )
         self.assertEqual(
             response.headers.get('Access-Control-Allow-Methods'),
@@ -558,7 +556,6 @@ class HttpbinTestCase(unittest.TestCase):
             'PUT',
             'DELETE',
             'PATCH',
-            'TRACE',
         ]
         for m in methods:
             response = self.app.open(path='/status/418', method=m)

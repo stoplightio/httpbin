@@ -27,4 +27,6 @@ def weighted_choice(choices):
         cum_weights.append(total)
     x = random.uniform(0, total)
     i = bisect.bisect(cum_weights, x)
+    # Guard against floating-point edge case where x == total
+    i = min(i, len(values) - 1)
     return values[i]

@@ -13,8 +13,7 @@ import re
 import time
 import os
 from hashlib import md5, sha256, sha512
-from werkzeug.http import parse_authorization_header
-from werkzeug.datastructures import WWWAuthenticate
+from werkzeug.datastructures import WWWAuthenticate, Authorization
 
 from flask import request, make_response
 from six.moves.urllib.parse import urlparse, urlunparse
@@ -23,7 +22,7 @@ from six.moves.urllib.parse import urlparse, urlunparse
 from .structures import CaseInsensitiveDict
 
 
-ASCII_ART = """
+ASCII_ART = r"""
     -=[ teapot ]=-
 
        _...._
@@ -68,7 +67,7 @@ ACCEPTED_MEDIA_TYPES = [
     'image/*'
 ]
 
-ANGRY_ASCII ="""
+ANGRY_ASCII = r"""
           .-''''''-.
         .' _      _ '.
        /   O      O   \\
@@ -163,6 +162,9 @@ def get_url(request):
         protocol = 'https'
     if protocol is None:
         return request.url
+    # Validate the forwarded protocol to prevent header spoofing
+    if protocol.lower() not in ('http', 'https'):
+        protocol = 'http'
     url = list(urlparse(request.url))
     url[0] = protocol
     return urlunparse(url)
@@ -356,12 +358,12 @@ def check_digest_auth(user, passwd):
     """Check user authentication using HTTP Digest auth"""
 
     if request.headers.get('Authorization'):
-        credentials = parse_authorization_header(request.headers.get('Authorization'))
+        credentials = Authorization.from_header(request.headers.get('Authorization'))
         if not credentials:
             return
         request_uri = request.script_root + request.path
         if request.query_string:
-            request_uri +=  '?' + request.query_string
+            request_uri += '?' + request.query_string.decode('utf-8')
         response_hash = response(credentials, passwd, dict(uri=request_uri,
                                                            body=request.data,
                                                            method=request.method))
@@ -402,12 +404,12 @@ def __parse_request_range(range_header_text):
 
     try:
         right = int(components[1])
-    except:
+    except (ValueError, IndexError):
         pass
 
     try:
         left = int(components[0])
-    except:
+    except (ValueError, IndexError):
         pass
 
     return left, right
@@ -435,7 +437,7 @@ def parse_multi_value_header(header_str):
     if header_str:
         parts = header_str.split(',')
         for part in parts:
-            match = re.search('\s*(W/)?\"?([^"]*)\"?\s*', part)
+            match = re.search(r'\s*(W/)?\"?([^"]*)\"?\s*', part)
             if match is not None:
                 parsed_parts.append(match.group(2))
     return parsed_parts
@@ -462,9 +464,9 @@ def digest_challenge_response(app, qop, algorithm, stale = False):
         b':',
         str(time.time()).encode('ascii'),
         b':',
-        os.urandom(10)
+        os.urandom(16)  # 128 bits of entropy for secure nonce generation
     ]), algorithm)
-    opaque = H(os.urandom(10), algorithm)
+    opaque = H(os.urandom(16), algorithm)
 
     auth = WWWAuthenticate("digest")
     auth.set_digest('me@kennethreitz.com', nonce, opaque=opaque,

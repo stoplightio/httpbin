@@ -1,6 +1,8 @@
-version: '2'
 services:
     httpbin:
       build: '.'
       ports:
         - '80:80'
+      security_opt:
+        - no-new-privileges:true
+      read_only: true
