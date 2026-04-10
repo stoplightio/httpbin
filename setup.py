@@ -35,7 +35,7 @@ setup(
     packages=find_packages(),
     include_package_data = True, # include files listed in MANIFEST.in
     install_requires=[
-        'Flask', 'MarkupSafe', 'decorator', 'itsdangerous', 'six', 'brotlipy',
-        'raven[flask]', 'werkzeug>=0.14.1', 'gevent', 'flasgger'
+        'Flask~=2.2.4', 'MarkupSafe', 'decorator', 'itsdangerous', 'six', 'brotlipy',
+        'raven[flask]', 'werkzeug~=2.3', 'gevent>=23.9.0', 'flasgger>=0.9.7'
     ],
 )
